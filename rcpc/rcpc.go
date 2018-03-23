@@ -1,4 +1,5 @@
 package rcpc
+
 //reflect chan procedure call
 
 import (
@@ -7,7 +8,7 @@ import (
 	"sync"
 )
 
-type Agent interface {
+type Client interface {
 	Send(string, ...interface{}) error
 	Call(string, ...interface{}) ([]interface{}, error)
 }
@@ -31,9 +32,13 @@ type Server struct {
 	wait sync.WaitGroup
 }
 
-func (r *Server) Close () {
+func (r *Server) Close() {
 	close(r.c)
 	r.wait.Wait()
+    f := r.self.MethodByName("Close")
+    if f.IsValid() {
+        do(f, []reflect.Value{})
+    }
 }
 
 func do(f reflect.Value, v []reflect.Value) (ret []interface{}, err error) {
@@ -47,48 +52,48 @@ func do(f reflect.Value, v []reflect.Value) (ret []interface{}, err error) {
 }
 
 func getValue(in []interface{}) []reflect.Value {
-    l := len(in)
-    ret := make([]reflect.Value, l)
-    for i:=0; i < l; i++ {
-        ret[i] = reflect.ValueOf(in[i])
-    }
-    return ret
+	l := len(in)
+	ret := make([]reflect.Value, l)
+	for i := 0; i < l; i++ {
+		ret[i] = reflect.ValueOf(in[i])
+	}
+	return ret
 }
 
 func getInterface(in []reflect.Value) []interface{} {
-    l := len(in)
-    ret := make([]interface{}, l)
-    for i:=0; i < l; i++ {
-        ret[i] = in[i].Interface()
-    }
-    return ret
+	l := len(in)
+	ret := make([]interface{}, l)
+	for i := 0; i < l; i++ {
+		ret[i] = in[i].Interface()
+	}
+	return ret
 }
 
-func NewServer (self interface{}) *Server {
-    r := new(Server)
+func NewServer(self interface{}) *Server {
+	r := new(Server)
 	r.self = reflect.ValueOf(self)
 	r.c = make(chan message, chan_cache_len)
 	r.wait.Add(1)
 
-	go func () {
-        defer r.wait.Done()
-        for val := range r.c {
-            f := r.self.MethodByName(val.cmd)
-            var ret []interface{}
-            var err error
-            if f.IsValid() {
-                ret, err = do(f, val.arg)
-            } else {
-                err = errors.New("not find func:" + val.cmd)
-            }
+	go func() {
+		defer r.wait.Done()
+		for val := range r.c {
+			f := r.self.MethodByName(val.cmd)
+			var ret []interface{}
+			var err error
+			if f.IsValid() {
+				ret, err = do(f, val.arg)
+			} else {
+				err = errors.New("not find func:" + val.cmd)
+			}
 
-            if val.ret != nil {
-                val.ret <- call_ret{ret, err}
-                close(val.ret)
-            }
-        }
-    }()
-    return r
+			if val.ret != nil {
+				val.ret <- call_ret{ret, err}
+				close(val.ret)
+			}
+		}
+	}()
+	return r
 }
 
 func (r *Server) Send(cmd string, arg ...interface{}) (err error) {
