@@ -28,17 +28,17 @@ type message struct {
 
 type Server struct {
 	self reflect.Value
-	c    chan message
+	c    chan *message
 	wait sync.WaitGroup
 }
 
 func (r *Server) Close() {
 	close(r.c)
 	r.wait.Wait()
-    f := r.self.MethodByName("Close")
-    if f.IsValid() {
-        do(f, []reflect.Value{})
-    }
+	f := r.self.MethodByName("Close")
+	if f.IsValid() {
+		do(f, []reflect.Value{})
+	}
 }
 
 func do(f reflect.Value, v []reflect.Value) (ret []interface{}, err error) {
@@ -72,7 +72,7 @@ func getInterface(in []reflect.Value) []interface{} {
 func NewServer(self interface{}) *Server {
 	r := new(Server)
 	r.self = reflect.ValueOf(self)
-	r.c = make(chan message, chan_cache_len)
+	r.c = make(chan *message, chan_cache_len)
 	r.wait.Add(1)
 
 	go func() {
@@ -103,7 +103,7 @@ func (r *Server) Send(cmd string, arg ...interface{}) (err error) {
 		}
 	}()
 
-	r.c <- message{cmd, getValue(arg), nil}
+	r.c <- &message{cmd, getValue(arg), nil}
 	return
 }
 
@@ -116,7 +116,7 @@ func (r *Server) Call(cmd string, arg ...interface{}) (ret []interface{}, err er
 
 	ret_c := make(chan call_ret)
 
-	r.c <- message{cmd, getValue(arg), ret_c}
+	r.c <- &message{cmd, getValue(arg), ret_c}
 
 	ret_val := <-ret_c
 	ret = ret_val.val
