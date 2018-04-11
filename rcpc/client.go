@@ -32,19 +32,23 @@ var ErrNotFindMethod = errors.New("not find method")
 var ErrArgvType = errors.New("argv type Error")
 var ErrReplyvType = errors.New("replyv type Error")
 var ErrClosedChannel = errors.New("channel is closed")
+var ErrReplyCantSet = errors.New("reply value cant set")
+
+const channel_len = 8192
 
 func NewClient(rcvr interface{}) (*rpc.Client, error) {
 	codec, err := NewClientCodec(rcvr)
 	if err != nil {
 		return nil, err
 	}
+
 	return rpc.NewClientWithCodec(codec), nil
 }
 
 func NewClientCodec(rcvr interface{}) (rpc.ClientCodec, error) {
 	s := new(ClientCodec)
-	s.write_c = make(chan *message, 8192)
-	s.read_c = make(chan *message, 8192)
+	s.write_c = make(chan *message, channel_len)
+	s.read_c = make(chan *message, channel_len)
 	s.msgLock = new(sync.Mutex)
 	var err error
 	s.service, err = newservice(rcvr)
@@ -140,13 +144,18 @@ func (c *ClientCodec) ReadResponseHeader(rep *rpc.Response) error {
 }
 func (c *ClientCodec) ReadResponseBody(reply interface{}) error {
 	v := reflect.ValueOf(reply)
-	if !v.IsValid() {
+	if !v.IsValid() || v.IsNil() {
 		return nil
+		return ErrReplyCantSet
 	}
 	if v.Type() != c.temp.mtype.ReplyType {
+		return nil
 		return ErrReplyvType
 	}
-	v.Elem().Set(c.temp.replyv.Elem())
+
+	if v.Elem().CanSet() {
+		v.Elem().Set(c.temp.replyv.Elem())
+	}
 	c.freemessage(c.temp)
 	return nil
 }
