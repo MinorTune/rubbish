@@ -9,10 +9,21 @@ import (
 	"unicode/utf8"
 )
 
+const rpc_chan_len = 8192
+
 var type_method *sync.Map
+var call_pool *sync.Pool
+var send_pool *sync.Pool
 
 func init() {
 	type_method = new(sync.Map)
+	call_pool = new(sync.Pool)
+	call_pool.New = func() interface{} {
+		return &Call{Done: make(chan *Call, 1)}
+	}
+	send_pool = new(sync.Pool)
+	send_pool.New = func() interface{} { return new(Call) }
+
 }
 
 type Call struct {
@@ -28,6 +39,8 @@ type Call struct {
 func (c *Call) done() {
 	if c.Done != nil {
 		c.Done <- c
+	} else {
+		send_pool.Put(c)
 	}
 }
 
@@ -46,19 +59,19 @@ type Server struct {
 
 var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
 
-var ErrServerClosed = errors.New("chan server is closed")
+var ErrServerClosed = errors.New("cpc server is closed")
 var ErrMethodNotRegister = errors.New("cmd not register")
-var ErrMethodNotSend = errors.New("cmd is call func")
+var ErrMethodNotSend = errors.New("cmd need reply value")
 var ErrMethodArgType = errors.New("arg type error")
 var ErrMethodReplyType = errors.New("reply type error")
-var ErrMethodRunTime = errors.New("method runtime error")
+var ErrMethodRunTime = errors.New("cmd runtime error")
 
 func NewServer(sev interface{}) *Server {
 	rcvr := reflect.ValueOf(sev)
 	rctype := rcvr.Type()
 	mtypeinter, ok := type_method.Load(rctype)
 
-	s := &Server{msg: make(chan *Call, 8192), rcvr: rcvr, wg: new(sync.WaitGroup)}
+	s := &Server{msg: make(chan *Call, rpc_chan_len), rcvr: rcvr, wg: new(sync.WaitGroup)}
 	if ok {
 		s.method = mtypeinter.(map[string]*methodType)
 	} else {
@@ -72,18 +85,16 @@ func NewServer(sev interface{}) *Server {
 }
 
 func do(call *Call) {
-	defer call.done()
-
 	defer func() {
 		if e := recover(); e != nil {
 			call.Error = ErrMethodRunTime
 		}
+		call.done()
 	}()
 
 	returnValues := call.method.method.Func.Call(call.refarg)
 	if len(returnValues) != 0 {
-		err := returnValues[0].Interface()
-		if err != nil {
+		if err := returnValues[0].Interface(); err != nil {
 			call.Error = err.(error)
 		}
 	}
@@ -114,64 +125,80 @@ func (s *Server) Send(cmd string, arg interface{}) (err error) {
 		return
 	}
 
-	call := &Call{Cmd: cmd, Argv: arg, refarg: []reflect.Value{s.rcvr, argrv}, method: mtype}
+	call := send_pool.Get().(*Call)
+	call.Cmd = cmd
+	call.Argv = arg
+	call.refarg = []reflect.Value{s.rcvr, argrv}
+	call.method = mtype
 
 	defer func() {
 		if e := recover(); e != nil {
 			err = ErrServerClosed
+			send_pool.Put(call)
 		}
 	}()
 	s.msg <- call
 	return
 }
 
-func (s *Server) Call(cmd string, arg, reply interface{}) error {
-	return (<-s.Go(cmd, arg, reply).Done).Error
+func (s *Server) Call(cmd string, arg, reply interface{}) (err error) {
+	call := <-s.Go(cmd, arg, reply).Done
+	err = call.Error
+	call_pool.Put(call)
+	return
 }
 
 func (s *Server) Go(cmd string, arg, reply interface{}) (call *Call) {
-	call = &Call{Cmd: cmd, Argv: arg, Replyv: reply, Done: make(chan *Call, 1)}
+	call = call_pool.Get().(*Call)
+	defer func() {
+		if e := recover(); e != nil {
+			call.Error = ErrServerClosed
+		}
+		if call.Error != nil {
+			call.done()
+		}
+	}()
 
 	mtype, ok := s.method[cmd]
 	if !ok {
 		call.Error = ErrMethodNotRegister
-		call.done()
 		return
 	}
 
 	argrv := reflect.ValueOf(arg)
 	if !argrv.IsValid() || argrv.Type() != mtype.ArgType || !argrv.Elem().IsValid() {
 		call.Error = ErrMethodArgType
-		call.done()
 		return
 	}
 
 	reprv := reflect.ValueOf(reply)
 	if !reprv.IsValid() || reprv.Type() != mtype.ReplyType || !reprv.Elem().CanSet() {
 		call.Error = ErrMethodReplyType
-		call.done()
 		return
 	}
 
+	call.Cmd = cmd
+	call.Argv = arg
+	call.Replyv = reply
 	call.refarg = []reflect.Value{s.rcvr, argrv, reprv}
 	call.method = mtype
 
-	defer func() {
-		if e := recover(); e != nil {
-			call.Error = ErrServerClosed
-			call.done()
-		}
-	}()
 	s.msg <- call
 	return call
 }
 
-func (s *Server) Close() error {
+func (s *Server) Close() (err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = e.(error)
+		}
+	}()
 	close(s.msg)
 	s.wg.Wait()
-	return nil
+	return
 }
 
+//from goroot/src/net/rpc/
 // Is this an exported - upper case - name?
 func isExported(name string) bool {
 	rune, _ := utf8.DecodeRuneInString(name)
