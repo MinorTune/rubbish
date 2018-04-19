@@ -109,14 +109,21 @@ func (s *Server) run() {
 
 func (s *Server) Send(cmd string, arg interface{}) (err error) {
 	mtype, ok := s.method[cmd]
+	call := send_pool.Get().(*Call)
+	defer func() {
+		if e := recover(); e != nil {
+			err = ErrServerClosed
+			send_pool.Put(call)
+		}
+	}()
 	if !ok {
 		err = ErrMethodNotRegister
 		return
 	}
 
 	argrv := reflect.ValueOf(arg)
-	if argrv.Type() != mtype.ArgType {
-		err = ErrMethodArgType
+	if !argrv.IsValid() || argrv.Type() != mtype.ArgType || !argrv.Elem().IsValid() {
+		call.Error = ErrMethodArgType
 		return
 	}
 
@@ -125,18 +132,11 @@ func (s *Server) Send(cmd string, arg interface{}) (err error) {
 		return
 	}
 
-	call := send_pool.Get().(*Call)
 	call.Cmd = cmd
 	call.Argv = arg
 	call.refarg = []reflect.Value{s.rcvr, argrv}
 	call.method = mtype
 
-	defer func() {
-		if e := recover(); e != nil {
-			err = ErrServerClosed
-			send_pool.Put(call)
-		}
-	}()
 	s.msg <- call
 	return
 }
