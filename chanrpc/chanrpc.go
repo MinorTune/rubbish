@@ -2,223 +2,163 @@ package chanrpc
 
 import (
 	"errors"
-	"log"
 	"reflect"
 	"sync"
-	"unicode"
-	"unicode/utf8"
 )
 
-const rpc_chan_len = 8192
+var rpc_server_closed = errors.New("rpc server is closed")
+var command_not_register = errors.New("rpc server command not register")
+var rpc_runtime_panic = errors.New("rpc server runtime panic")
 
-var type_method *sync.Map
 var call_pool *sync.Pool
-var send_pool *sync.Pool
+var methods_map *sync.Map
 
 func init() {
-	type_method = new(sync.Map)
 	call_pool = new(sync.Pool)
 	call_pool.New = func() interface{} {
-		return &Call{Done: make(chan *Call, 1)}
+		return &Call{}
 	}
-	send_pool = new(sync.Pool)
-	send_pool.New = func() interface{} { return new(Call) }
 
+	methods_map = new(sync.Map)
 }
 
 type Call struct {
-	Cmd    string
-	Argv   interface{}
-	Replyv interface{}
-	Error  error
-	Done   chan *Call
-	refarg []reflect.Value
-	method *methodType
+	method *reflect.Method
+	args   []reflect.Value
+	err    error
+	c      chan struct{}
 }
 
-func (c *Call) done() {
-	if c.Done != nil {
-		c.Done <- c
-	} else {
-		send_pool.Put(c)
-	}
-}
-
-type methodType struct {
-	method    reflect.Method
-	ArgType   reflect.Type
-	ReplyType reflect.Type
-}
-
-type Server struct {
-	msg    chan *Call
-	rcvr   reflect.Value
-	method map[string]*methodType
-	wg     *sync.WaitGroup
-}
-
-var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
-
-var ErrServerClosed = errors.New("cpc server is closed")
-var ErrMethodNotRegister = errors.New("cmd not register")
-var ErrMethodNotSend = errors.New("cmd need reply value")
-var ErrMethodArgType = errors.New("arg type error")
-var ErrMethodReplyType = errors.New("reply type error")
-var ErrMethodRunTime = errors.New("cmd runtime error")
-
-func NewServer(sev interface{}) *Server {
-	rcvr := reflect.ValueOf(sev)
-	rctype := rcvr.Type()
-	mtypeinter, ok := type_method.Load(rctype)
-
-	s := &Server{msg: make(chan *Call, rpc_chan_len), rcvr: rcvr, wg: new(sync.WaitGroup)}
-	if ok {
-		s.method = mtypeinter.(map[string]*methodType)
-	} else {
-		s.method = suitableMethods(rctype, false)
-		type_method.Store(rctype, s.method)
-	}
-
-	s.wg.Add(1)
-	go s.run()
-	return s
-}
-
-func do(call *Call) {
-	defer func() {
-		if e := recover(); e != nil {
-			call.Error = ErrMethodRunTime
-		}
-		call.done()
-	}()
-
-	returnValues := call.method.method.Func.Call(call.refarg)
-	if len(returnValues) != 0 {
-		if err := returnValues[0].Interface(); err != nil {
-			call.Error = err.(error)
-		}
-	}
-}
-
-func (s *Server) run() {
-	for v := range s.msg {
-		do(v)
-	}
-	s.wg.Done()
-}
-
-func (s *Server) Send(cmd string, arg interface{}) (err error) {
-	mtype, ok := s.method[cmd]
-	call := send_pool.Get().(*Call)
-	defer func() {
-		if e := recover(); e != nil {
-			err = ErrServerClosed
-			send_pool.Put(call)
-		}
-	}()
-	if !ok {
-		err = ErrMethodNotRegister
-		return
-	}
-
-	argrv := reflect.ValueOf(arg)
-	if !argrv.IsValid() || argrv.Type() != mtype.ArgType || !argrv.Elem().IsValid() {
-		call.Error = ErrMethodArgType
-		return
-	}
-
-	if mtype.ReplyType != nil {
-		err = ErrMethodNotSend
-		return
-	}
-
-	call.Cmd = cmd
-	call.Argv = arg
-	call.refarg = []reflect.Value{s.rcvr, argrv}
-	call.method = mtype
-
-	s.msg <- call
-	return
-}
-
-func (s *Server) Call(cmd string, arg, reply interface{}) (err error) {
-	call := <-s.Go(cmd, arg, reply).Done
-	err = call.Error
+func (call *Call) Done() (err error) {
+	<-call.c
+	err = call.err
 	call_pool.Put(call)
 	return
 }
 
-func (s *Server) Go(cmd string, arg, reply interface{}) (call *Call) {
-	call = call_pool.Get().(*Call)
+func (call *Call) done() {
+	if call.c != nil {
+		close(call.c)
+	} else {
+		call_pool.Put(call)
+	}
+}
+
+func (s *Server) putCall(call *Call) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
-			call.Error = ErrServerClosed
-		}
-		if call.Error != nil {
+			err = rpc_server_closed
 			call.done()
 		}
 	}()
-
-	mtype, ok := s.method[cmd]
-	if !ok {
-		call.Error = ErrMethodNotRegister
-		return
-	}
-
-	argrv := reflect.ValueOf(arg)
-	if !argrv.IsValid() || argrv.Type() != mtype.ArgType || !argrv.Elem().IsValid() {
-		call.Error = ErrMethodArgType
-		return
-	}
-
-	reprv := reflect.ValueOf(reply)
-	if !reprv.IsValid() || reprv.Type() != mtype.ReplyType || !reprv.Elem().CanSet() {
-		call.Error = ErrMethodReplyType
-		return
-	}
-
-	call.Cmd = cmd
-	call.Argv = arg
-	call.Replyv = reply
-	call.refarg = []reflect.Value{s.rcvr, argrv, reprv}
-	call.method = mtype
-
-	s.msg <- call
-	return call
-}
-
-func (s *Server) Close() (err error) {
-	defer func() {
-		if e := recover(); e != nil {
-			err = e.(error)
-		}
-	}()
-	close(s.msg)
-	s.wg.Wait()
+	s.call_store <- call
 	return
 }
 
-//from goroot/src/net/rpc/
-// Is this an exported - upper case - name?
-func isExported(name string) bool {
-	rune, _ := utf8.DecodeRuneInString(name)
-	return unicode.IsUpper(rune)
+type Server struct {
+	method  map[string]*reflect.Method
+	self_rv reflect.Value
+
+	call_store chan *Call
+	wt         *sync.WaitGroup
 }
 
-// Is this type exported or a builtin?
-func isExportedOrBuiltinType(t reflect.Type) bool {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
+func NewRpc(r interface{}) *Server {
+	s := new(Server)
+	s.self_rv = reflect.ValueOf(r)
+	s.call_store = make(chan *Call, 256)
+
+	self_typ := s.self_rv.Type()
+	methods, ok := methods_map.Load(self_typ)
+	if ok {
+		s.method = methods.(map[string]*reflect.Method)
+	} else {
+		s.method = suitableMethods(self_typ)
+		methods_map.Store(self_typ, s.method)
 	}
-	// PkgPath will be non-empty even for an exported type,
-	// so we need to check the type name as well.
-	return isExported(t.Name()) || t.PkgPath() == ""
+
+	s.wt = new(sync.WaitGroup)
+	s.wt.Add(1)
+	go func() {
+		for c := range s.call_store {
+			docall(c)
+		}
+
+		s.wt.Done()
+	}()
+	return s
 }
 
-// suitableMethods returns suitable Rpc methods of typ, it will report
-// error using log if reportErr is true.
-func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
-	methods := make(map[string]*methodType)
+func docall(call *Call) {
+	defer func() {
+		if e := recover(); e != nil {
+			if str, ok := e.(string); ok {
+				call.err = errors.New(str)
+			} else if err, ok := e.(error); ok {
+				call.err = err
+			} else {
+				call.err = rpc_runtime_panic
+			}
+		}
+		call.done()
+	}()
+	call.method.Func.Call(call.args)
+}
+
+func (s *Server) Send(cmd string, args ...interface{}) (err error) {
+	method, ok := s.method[cmd]
+	if !ok {
+		err = command_not_register
+		return
+	}
+
+	call := call_pool.Get().(*Call)
+	call.c = nil
+
+	call.method = method
+
+	args_len := len(args)
+	call.args = make([]reflect.Value, args_len+1)
+	call.args[0] = s.self_rv
+	for i := 0; i < args_len; i++ {
+		call.args[i+1] = reflect.ValueOf(args[i])
+	}
+
+	err = s.putCall(call)
+	return
+}
+func (s *Server) Call(cmd string, args ...interface{}) error {
+	return s.Go(cmd, args...).Done()
+}
+func (s *Server) Go(cmd string, args ...interface{}) (call *Call) {
+	call = call_pool.Get().(*Call)
+	call.c = make(chan struct{})
+
+	var ok bool
+	call.method, ok = s.method[cmd]
+	if !ok {
+		call.err = command_not_register
+		call.done()
+		return
+	}
+
+	args_len := len(args)
+	call.args = make([]reflect.Value, args_len+1)
+	call.args[0] = s.self_rv
+	for i := 0; i < args_len; i++ {
+		call.args[i+1] = reflect.ValueOf(args[i])
+	}
+
+	err := s.putCall(call)
+	if err != nil {
+		call.err = err
+		call.done()
+	}
+	return
+}
+func suitableMethods(typ reflect.Type) map[string]*reflect.Method {
+	methods := make(map[string]*reflect.Method)
+
 	for m := 0; m < typ.NumMethod(); m++ {
 		method := typ.Method(m)
 		mtype := method.Type
@@ -227,51 +167,10 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 		if method.PkgPath != "" {
 			continue
 		}
-		// Method needs three ins: receiver, *args, *reply.
-		var replyType reflect.Type
-		if mtype.NumIn() == 3 {
-			// Second arg must be a pointer.
-			replyType = mtype.In(2)
-			if replyType.Kind() != reflect.Ptr {
-				if reportErr {
-					log.Printf("rpc.Register: reply type of method %q is not a pointer: %q\n", mname, replyType)
-				}
-				continue
-			}
-			// Reply type must be exported.
-			if !isExportedOrBuiltinType(replyType) {
-				if reportErr {
-					log.Printf("rpc.Register: reply type of method %q is not exported: %q\n", mname, replyType)
-				}
-				continue
-			}
-			// Method needs one out.
-			if mtype.NumOut() != 1 {
-				if reportErr {
-					log.Printf("rpc.Register: method %q has %d output parameters; needs exactly one\n", mname, mtype.NumOut())
-				}
-				continue
-			}
-			// The return type of the method must be error.
-			if returnType := mtype.Out(0); returnType != typeOfError {
-				if reportErr {
-					log.Printf("rpc.Register: return type of method %q is %q, must be error\n", mname, returnType)
-				}
-				continue
-			}
-		} else if mtype.NumIn() != 2 {
-			log.Printf("rpc.Register: method %q has %d input parameters; needs exactly three\n", mname, mtype.NumIn())
-			continue
+
+		if mtype.NumOut() == 0 {
+			methods[mname] = &method
 		}
-		// First arg need not be a pointer.
-		argType := mtype.In(1)
-		if !isExportedOrBuiltinType(argType) {
-			if reportErr {
-				log.Printf("rpc.Register: argument type of method %q is not exported: %q\n", mname, argType)
-			}
-			continue
-		}
-		methods[mname] = &methodType{method: method, ArgType: argType, ReplyType: replyType}
 	}
 	return methods
 }
